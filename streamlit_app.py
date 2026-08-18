@@ -8,23 +8,23 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-from wave_replay.data import fetch_binance_klines, load_csv_bytes
+from wave_replay.data import fetch_binance_klines, load_csv_bytes, resample_ohlcv
 from wave_replay.features import add_features, snapshot_features
 from wave_replay.swings import detect_swings, structural_nodes, swings_to_frame
 from wave_replay.confluence import collect_levels, cluster_zones, zones_to_frame
 from wave_replay.elliott import infer_wave_structure
-from wave_replay.benchmarks import compare_to_reference, REFERENCE_BENCHMARKS
+from wave_replay.benchmarks import compare_to_reference, REFERENCE_BENCHMARKS, benchmark_cutoff, benchmark_summary
 from wave_replay.report import make_text_report
 
 
 st.set_page_config(
-    page_title="WAVE-Replay V0.1",
+    page_title="WAVE-Replay V0.2",
     page_icon="〰️",
     layout="wide",
 )
 
-st.title("WAVE-Replay V0.1")
-st.caption("WAVE 推演引擎行为复现 · 第一阶段：结构节点 / Fibonacci / 共振区 / Elliott候选计数")
+st.title("WAVE-Replay V0.2")
+st.caption("WAVE 推演引擎行为复现 · V0.2：样本时间对齐 + 一对一节点匹配 + 区域单独评分")
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -99,6 +99,14 @@ with st.sidebar:
             symbol = quick
         interval = st.selectbox("K线周期", ["1d", "4h", "1h"], index=0)
 
+        has_ref = symbol.upper() in REFERENCE_BENCHMARKS
+        replay_sample = st.checkbox(
+            "WAVE样本复现模式",
+            value=has_ref,
+            disabled=not has_ref,
+            help="自动对齐内置WAVE报告时刻，并用小时K聚合当时可见日K，避免用未来完整日K做历史回放。"
+        )
+
         today = date.today()
         asof = st.date_input("截止日期", value=today)
         lookback_days = st.select_slider(
@@ -146,14 +154,28 @@ if not run:
 try:
     with st.spinner("读取行情并计算结构…"):
         if source == "Binance公共行情":
-            end_ts = pd.Timestamp(asof) + pd.Timedelta(days=1) - pd.Timedelta(milliseconds=1)
-            start_ts = pd.Timestamp(asof) - pd.Timedelta(days=int(lookback_days))
-            raw = cached_binance(symbol, interval, str(start_ts), str(end_ts), int(max_bars))
+            if replay_sample and symbol.upper() in REFERENCE_BENCHMARKS:
+                cutoff = benchmark_cutoff(symbol)
+                start_ts = cutoff - pd.Timedelta(days=430)
+                # 先抓到报告时刻为止的1H数据，再聚合成“当时可见”的日K。
+                # 这样不会把报告生成之后的日内高低点偷看进历史样本。
+                hourly = cached_binance(
+                    symbol, "1h", str(start_ts), str(cutoff),
+                    min(15000, max(10500, int(max_bars)))
+                )
+                raw = resample_ohlcv(hourly, "1D")
+                interval_effective = "1d(as-of reconstructed)"
+            else:
+                end_ts = pd.Timestamp(asof) + pd.Timedelta(days=1) - pd.Timedelta(milliseconds=1)
+                start_ts = pd.Timestamp(asof) - pd.Timedelta(days=int(lookback_days))
+                raw = cached_binance(symbol, interval, str(start_ts), str(end_ts), int(max_bars))
+                interval_effective = interval
         else:
             if upload is None:
                 st.error("请先上传CSV。")
                 st.stop()
             raw = load_csv_bytes(upload.getvalue())
+            interval_effective = interval
 
         df = add_features(raw)
         swings = detect_swings(df, min_pct=min_pct, atr_mult=atr_mult)
@@ -220,12 +242,39 @@ with tab5:
             f"参考 WAVE 样本：{symbol.upper()} · "
             f"报告时间 `{ref['report_time']}` · 基准价 `{ref['basis_price']}`"
         )
-        bdf = compare_to_reference(symbol, nodes)
+
+        bdf = compare_to_reference(symbol, nodes, zones)
+        summary = benchmark_summary(symbol, snap["price"], bdf)
+
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("当前/重建基准价", fmt(snap["price"]))
+        c2.metric("WAVE基准价", fmt(summary.get("wave_basis")))
+        c3.metric("基准价偏差", "—" if summary.get("basis_diff_pct") is None else f"{summary['basis_diff_pct']:.2f}%")
+        c4.metric("命中/未命中", f"{summary.get('hit_count', 0)} / {summary.get('miss_count', 0)}")
+
         st.dataframe(bdf, use_container_width=True, hide_index=True)
-        if not bdf.empty and bdf["误差%"].notna().any():
-            st.metric("参考节点平均绝对百分比误差", f"{bdf['误差%'].dropna().mean():.2f}%")
-        st.warning(
-            "注意：只有当当前行情源/截止时间与WAVE样本的数据口径一致时，这个误差才具有严格比较意义。"
+
+        c5, c6 = st.columns(2)
+        c5.metric(
+            "命中项目平均误差",
+            "—" if summary.get("mean_error_pct") is None else f"{summary['mean_error_pct']:.2f}%"
+        )
+        c6.metric(
+            "命中项目中位误差",
+            "—" if summary.get("median_error_pct") is None else f"{summary['median_error_pct']:.2f}%"
+        )
+
+        if replay_sample:
+            st.success("已启用 WAVE 样本复现模式：报告时间自动对齐，日K由报告时刻之前的小时K重建。")
+        elif not summary.get("score_valid"):
+            st.warning(
+                "当前运行时点与WAVE样本基准价偏差超过1%，本轮误差只供参考。"
+                "建议勾选左侧「WAVE样本复现模式」后重跑。"
+            )
+
+        st.caption(
+            "V0.2不再把支撑区当成单个Swing点比较；结构节点按类型+时间窗一对一匹配，"
+            "共振区域单独和WAVE区域比较。"
         )
     else:
         st.info("当前标的没有内置 WAVE 对照样本。")
@@ -236,7 +285,7 @@ st.text_area("报告", report_text, height=460)
 
 export = {
     "symbol": symbol,
-    "interval": interval,
+    "interval": interval_effective,
     "snapshot": snap,
     "wave": wave.to_dict(),
     "nodes": [p.to_dict() for p in nodes],
