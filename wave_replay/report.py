@@ -25,7 +25,7 @@ def make_text_report(symbol: str, df, wave: WaveInference, zones: list[Zone]) ->
     resist = [z for z in zones if z.side == "resistance"][:3]
 
     lines = [
-        f"{symbol} · WAVE-Replay V0.1",
+        f"{symbol} · WAVE-Replay V0.2",
         "=" * 56,
         f"基准时间：{s['as_of']}",
         f"基准价：{_num(s['price'])}",
@@ -70,7 +70,7 @@ def make_text_report(symbol: str, df, wave: WaveInference, zones: list[Zone]) ->
     lines += [
         "",
         "【说明】",
-        "V0.1用于行为复现研究：先复现结构节点、Fibonacci、共振区和失效规则。",
+        "V0.2用于行为复现研究：先复现结构节点、Fibonacci、共振区和失效规则。",
         "当前Elliott计数为确定性启发式候选，不等同于WAVE内部私有算法，也不构成投资建议。",
     ]
     return "\n".join(lines)

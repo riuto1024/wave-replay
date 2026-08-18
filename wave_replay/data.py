@@ -179,3 +179,28 @@ def load_csv_bytes(data: bytes) -> pd.DataFrame:
         df = df.reset_index().rename(columns={df.index.name: "open_time"})
 
     return validate_ohlcv(df)
+
+
+def resample_ohlcv(df: pd.DataFrame, rule: str = "1D") -> pd.DataFrame:
+    """
+    将更小周期K线聚合成更大周期K线。
+    用于历史 WAVE 样本复现时避免“日K未来函数”：
+    先抓到报告时刻为止的小时K，再聚合出当时可见的日K。
+    """
+    d = validate_ohlcv(df).copy()
+    ts = pd.to_datetime(d["open_time"], errors="coerce")
+    if getattr(ts.dt, "tz", None) is None:
+        ts = ts.dt.tz_localize("Asia/Shanghai")
+    else:
+        ts = ts.dt.tz_convert("Asia/Shanghai")
+
+    d = d.assign(open_time=ts).set_index("open_time")
+    agg = d.resample(rule, label="left", closed="left").agg(
+        open=("open", "first"),
+        high=("high", "max"),
+        low=("low", "min"),
+        close=("close", "last"),
+        volume=("volume", "sum"),
+    )
+    agg = agg.dropna(subset=["open", "high", "low", "close"]).reset_index()
+    return validate_ohlcv(agg)
